@@ -1,0 +1,164 @@
+# Non-secret trading configuration (versioned, reviewable).
+# Secrets and the live-trading switch live in .env — never commit .env.
+# Risk limits set in the environment (MAX_DAILY_LOSS, MAX_RISK_PER_TRADE, MAX_TRADES_PER_DAY,
+# MAX_OPEN_POSITIONS) override the values below.
+
+engine:
+  base_timeframe: 1m          # candles are built from ticks at this resolution; higher TFs derive from it
+  default_product: MIS        # MIS = intraday (auto square-off), NRML = carry forward
+  warmup_days: 5              # days of historical 1m data fetched at start (needs Kite historical add-on)
+  expiry_day_exit_time: "15:00"   # option positions expiring today are closed at this time
+  option_stop_buffer_pct: 5       # option stops are stop-limit orders (SL-M is not allowed on options)
+
+# ---------------------------------------------------------------------------------------------------
+# Options automation. Strategies with `execution: options` analyse the underlying (index/stock future)
+# and the planner turns their bullish/bearish view into BUY_CE / BUY_PE / SELL_CE / SELL_PE.
+#   bullish -> BUY_CE (trending, options not expensive) or SELL_PE (ranging or options expensive)
+#   bearish -> BUY_PE                                    or SELL_CE
+# Any key can be overridden per strategy with an `options:` block.
+options:
+  style: auto                 # auto | buy_only | sell_only
+  buy_min_adx: 22             # ADX at/above this = trending -> buying options is allowed
+  sell_max_adx: 20            # ADX below this = ranging -> sell premium
+  iv_rich_ratio: 1.25         # ATM IV / realised volatility at/above this = options expensive -> sell
+  buy_delta: 0.50             # strike for bought options: |delta| ~0.5 (ATM)
+  sell_delta: 0.25            # strike for sold options: |delta| ~0.25 (OTM)
+  expiry: nearest             # nearest | next | monthly
+  min_dte_buy: 1.0            # days to expiry; don't buy on expiry day
+  min_dte_sell: 0.5           # don't sell into the last hours of an expiry
+  max_spread_pct: 3.0         # liquidity filters
+  min_oi: 0
+  min_premium: 5
+  buy_max_premium_loss_pct: 35    # premium stop for bought options (max % of premium lost)
+  sell_max_premium_loss_pct: 60   # premium stop for sold options (max % rise in premium)
+  default_rr: 2.0
+  chain_width: 15             # strikes either side of ATM fetched for selection
+  product: MIS                # intraday; squared off at risk.square_off_time
+
+paper:
+  slippage_bps: 2             # adverse slippage on market / stop-market fills
+  partial_fills: true         # limit fills to top-of-book quantity (live) / share of bar volume (backtest)
+  max_volume_participation: 0.25
+  futures_margin_pct: 0.15    # rough SPAN+exposure approximation; live uses Kite's margin API
+  option_short_margin_pct: 0.15
+
+risk:
+  # Sized for DEFAULT_CAPITAL=5,00,000: ~1% risk per trade, 3% max daily loss.
+  # One NIFTY futures lot (75) with a 1.5xATR 5m stop (~35 pts) risks ~2,600; a BANKNIFTY Supertrend
+  # stop can risk >10,000 per lot and will be rejected at these limits (by design).
+  max_daily_loss: 15000
+  max_risk_per_trade: 5000
+  max_trades_per_day: 5
+  max_open_positions: 3
+  max_consecutive_losses: 3
+  max_capital_utilization: 0.8
+  max_position_lots: 5
+  max_position_notional: 5000000
+  require_stop_loss: true
+  min_risk_reward: 1.0
+  max_stop_distance_pct: 3.0
+  allow_short: true
+  allow_option_selling: true      # option SELLING has large/unbounded risk: kept small by the caps below
+  max_short_option_lots: 1        # lots per option sell
+  max_premium_per_trade: 40000    # premium paid per option buy
+  min_option_premium: 5
+  max_option_stop_pct: 100        # option stops are % of premium
+  no_entries_before: "09:20"
+  no_new_entries_after: "15:00"
+  square_off_time: "15:15"
+  stale_data_seconds: 15
+  max_drawdown_pct: 10        # portfolio drawdown that trips the global kill switch
+  flatten_on_daily_halt: true
+  strategy_limits:
+    nifty_options_trend: {max_trades_per_day: 4}
+
+scoring:
+  enabled: true
+  min_score: 60
+  strong_threshold: 75
+  moderate_threshold: 60
+  weights: {trend: 20, ema: 15, rsi: 10, vwap: 15, volume: 15, price_action: 15, candlestick: 10, htf_trend: 0}
+  higher_timeframe: 15m
+
+# Per-strategy scoring (mean-reversion ideas should not be scored with trend weights).
+scoring_overrides:
+  rsi_reversal_nifty:
+    min_score: 50
+    weights: {trend: 0, ema: 0, rsi: 0, vwap: 15, volume: 25, price_action: 25, candlestick: 35, htf_trend: 0}
+
+strategies:
+  # ---- options automation (primary use) ----
+  - id: nifty_options_trend
+    type: ema_crossover
+    execution: options
+    instruments: ["FUT:NIFTY"]
+    timeframe: 5m
+    enabled: true
+    params: {fast: 9, slow: 21, atr_mult: 1.5, rr: 2.0}
+
+  - id: banknifty_options_supertrend
+    type: supertrend
+    execution: options
+    instruments: ["FUT:BANKNIFTY"]
+    timeframe: 5m
+    enabled: true
+    params: {period: 10, multiplier: 2.0, rr: 2.0}
+
+  - id: nifty_options_confluence
+    type: multi_confirmation
+    execution: options
+    instruments: ["FUT:NIFTY"]
+    timeframe: 15m
+    enabled: false
+    options: {style: buy_only}
+
+  - id: sensex_options_breakout
+    type: sr_breakout
+    execution: options
+    instruments: ["FUT:SENSEX"]
+    timeframe: 5m
+    enabled: false
+
+  # ---- futures (underlying) execution examples ----
+  - id: ema_cross_nifty
+    type: ema_crossover
+    instruments: ["FUT:NIFTY"]
+    timeframe: 5m
+    enabled: false
+    params: {fast: 20, slow: 50, atr_mult: 1.5, rr: 2.0}
+
+  - id: supertrend_banknifty
+    type: supertrend
+    instruments: ["FUT:BANKNIFTY"]
+    timeframe: 5m
+    enabled: false
+    params: {period: 10, multiplier: 3.0, rr: 2.0}
+
+  - id: vwap_breakout_nifty
+    type: vwap_breakout
+    instruments: ["FUT:NIFTY"]
+    timeframe: 5m
+    enabled: false
+    params: {min_volume_ratio: 1.5}
+
+  - id: rsi_reversal_nifty
+    type: rsi_reversal
+    instruments: ["FUT:NIFTY"]
+    timeframe: 15m
+    enabled: false
+
+  - id: breakout_banknifty
+    type: sr_breakout
+    instruments: ["FUT:BANKNIFTY"]
+    timeframe: 15m
+    enabled: false
+    params: {require_trend_alignment: true}
+
+# FEED_SOURCE=synthetic (paper mode only): simulated session for testing outside market hours.
+# Instruments below are synthetic stand-ins — prices are random walks, not market data.
+synthetic:
+  option_iv: 0.14             # model IV used to price synthetic option chains
+  instruments:
+    - {underlying: NIFTY, lot_size: 75, price: 25000, strike_step: 50}
+    - {underlying: BANKNIFTY, lot_size: 35, price: 56000, strike_step: 100}
+    - {underlying: SENSEX, lot_size: 20, price: 82000, strike_step: 100}
